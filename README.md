@@ -186,7 +186,7 @@ The endpoint is `http://127.0.0.1:3000/mcp` by default, with an unauthenticated 
 | `MCP_HTTP_HOST`            | `127.0.0.1` | Bind address                                                                                                 |
 | `MCP_HTTP_PORT`            | `3000`      | Port (`0` picks a free one)                                                                                  |
 | `MCP_HTTP_PATH`            | `/mcp`      | MCP endpoint path                                                                                            |
-| `MCP_AUTH_TOKEN`           | -           | Bearer token required on every MCP request                                                                   |
+| `MCP_AUTH_TOKEN`           | -           | Shared secret required on every MCP request, sent as `X-API-Key: <token>` or `Authorization: Bearer <token>` |
 | `MCP_ALLOW_UNAUTHENTICATED`| -           | Set to `true` to allow a non-loopback bind without a token (only behind an authenticating reverse proxy)      |
 | `MCP_ALLOWED_HOSTS`        | -           | Comma-separated `Host` header allowlist (DNS-rebinding protection)                                           |
 | `MCP_ALLOWED_ORIGINS`      | -           | Comma-separated `Origin` header allowlist                                                                    |
@@ -196,7 +196,7 @@ The endpoint is `http://127.0.0.1:3000/mcp` by default, with an unauthenticated 
 Security notes:
 
 - The server holds your Qualtrics API token and can enable write scopes on request, so treat access to the endpoint as access to your Qualtrics account. It refuses to listen on a non-loopback address without `MCP_AUTH_TOKEN`.
-- Terminate TLS in a reverse proxy in front of it before exposing it to the internet. Many hosted MCP clients also expect OAuth rather than a static bearer token; if yours does, put an authenticating proxy in front and set `MCP_ALLOW_UNAUTHENTICATED=true` on the server, which should then only be reachable through that proxy.
+- Terminate TLS in a reverse proxy in front of it before exposing it to the internet. If your MCP client cannot send a custom header and requires OAuth instead, put an authenticating proxy in front and set `MCP_ALLOW_UNAUTHENTICATED=true` on the server, which should then only be reachable through that proxy.
 - Large response exports are streamed to a file in `$HOME/Downloads` on the machine running the server, not returned to the client. In a container, mount a volume there if you need them.
 - The client-side rate limiter (`RATE_LIMIT_RPM`) is per session, not global.
 
@@ -210,7 +210,7 @@ cp .env.example .env     # set QUALTRICS_API_TOKEN, QUALTRICS_DATA_CENTER and MC
 docker compose up -d --build
 ```
 
-The compose example publishes the port on `127.0.0.1` only; put your reverse proxy in front of it. Then point an MCP client at the HTTPS URL with an `Authorization: Bearer <token>` header, for example in a Claude Code `.mcp.json`:
+The compose example publishes the port on `127.0.0.1` only; put your reverse proxy in front of it. Then point an MCP client at the HTTPS URL and send the token in an `X-API-Key` (or `Authorization: Bearer`) header. For a connector UI that supports custom headers, use the URL `https://mcp.example.com/mcp` with the header `x-api-key: <your MCP_AUTH_TOKEN>`. In a Claude Code `.mcp.json`:
 
 ```json
 {
@@ -218,7 +218,7 @@ The compose example publishes the port on `127.0.0.1` only; put your reverse pro
     "qualtrics": {
       "type": "http",
       "url": "https://mcp.example.com/mcp",
-      "headers": { "Authorization": "Bearer ${MCP_AUTH_TOKEN}" }
+      "headers": { "X-API-Key": "${MCP_AUTH_TOKEN}" }
     }
   }
 }

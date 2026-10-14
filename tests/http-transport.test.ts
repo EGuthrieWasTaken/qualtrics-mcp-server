@@ -42,10 +42,13 @@ function baseOptions(overrides: Partial<HttpServerOptions> = {}): HttpServerOpti
   };
 }
 
-async function connectClient(url: string, token: string | undefined = TOKEN): Promise<Client> {
+async function connectClient(
+  url: string,
+  headers: Record<string, string> = { Authorization: `Bearer ${TOKEN}` }
+): Promise<Client> {
   const client = new Client({ name: "http-test", version: "1.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(url), {
-    requestInit: token ? { headers: { Authorization: `Bearer ${token}` } } : undefined,
+    requestInit: { headers },
   });
   await client.connect(transport);
   return client;
@@ -102,6 +105,21 @@ test("HTTP transport enforces bearer auth, serves health, and rejects bad reques
         body: JSON.stringify(initialize),
       });
       assert.equal(wrongAuth.status, 401);
+
+      const wrongApiKey = await fetch(running.url, {
+        method: "POST",
+        headers: { ...headers, "X-API-Key": "wrong" },
+        body: JSON.stringify(initialize),
+      });
+      assert.equal(wrongApiKey.status, 401);
+
+      const apiKeyAuth = await fetch(running.url, {
+        method: "POST",
+        headers: { ...headers, "X-API-Key": TOKEN },
+        body: JSON.stringify(initialize),
+      });
+      assert.equal(apiKeyAuth.status, 200);
+      await apiKeyAuth.arrayBuffer();
 
       const auth = { ...headers, Authorization: `Bearer ${TOKEN}` };
 
@@ -177,6 +195,20 @@ test("HTTP transport exposes the full tool catalog and isolates write scopes per
     } finally {
       await first.close();
       await second.close();
+      await running.close();
+    }
+  });
+});
+
+test("a full MCP session works with the X-API-Key header alone", async () => {
+  await withQualtricsEnv(async () => {
+    const running = await startHttpServer(baseOptions());
+    const client = await connectClient(running.url, { "X-API-Key": TOKEN });
+    try {
+      const { tools } = await client.listTools();
+      assert.equal(tools.length, 112);
+    } finally {
+      await client.close();
       await running.close();
     }
   });

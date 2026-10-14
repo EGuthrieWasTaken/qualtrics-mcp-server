@@ -14,7 +14,8 @@
  *   MCP_HTTP_HOST            Bind address (default 127.0.0.1)
  *   MCP_HTTP_PORT            Port (default 3000; 0 picks a free port)
  *   MCP_HTTP_PATH            MCP endpoint path (default /mcp)
- *   MCP_AUTH_TOKEN           Bearer token required on every MCP request
+ *   MCP_AUTH_TOKEN           Shared secret required on every MCP request, sent as
+ *                            `X-API-Key: <token>` or `Authorization: Bearer <token>`
  *   MCP_ALLOW_UNAUTHENTICATED=true
  *                            Permit a non-loopback bind without MCP_AUTH_TOKEN
  *                            (only for use behind an authenticating proxy)
@@ -114,13 +115,23 @@ function digest(value: string): Buffer {
   return createHash("sha256").update(value).digest();
 }
 
+function tokensMatch(candidate: string, token: string): boolean {
+  // Compare fixed-length digests so neither length nor content leaks via timing.
+  return timingSafeEqual(digest(candidate), digest(token));
+}
+
+/**
+ * Accepts the shared secret either as `X-API-Key: <token>` (convenient for MCP
+ * connector UIs that let you set a custom header) or `Authorization: Bearer <token>`.
+ */
 function isAuthorized(req: IncomingMessage, token: string | undefined): boolean {
   if (!token) return true;
-  const header = req.headers.authorization ?? "";
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (!match) return false;
-  // Compare fixed-length digests so neither length nor content leaks via timing.
-  return timingSafeEqual(digest(match[1]), digest(token));
+
+  const apiKey = headerValue(req, "x-api-key");
+  if (apiKey !== undefined && tokensMatch(apiKey.trim(), token)) return true;
+
+  const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "");
+  return match !== null && tokensMatch(match[1].trim(), token);
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
