@@ -170,6 +170,60 @@ GUI-launched MCP clients such as Claude Desktop spawn servers with a minimal `PA
 
 The config above fixes both: an absolute `command` path handles the first layer, and the `PATH` entry in `env` handles shebang resolution. You can reproduce the failure outside the client by piping an `initialize` JSON-RPC request to the configured command with a stripped `PATH`.
 
+### Remote use over Streamable HTTP (optional)
+
+The stdio entrypoint above is the default and is unchanged. If you would rather run the server once, on a server or in a container, and connect to it from several machines or from a remote-connector client, use the HTTP entrypoint. It serves the same 112 tools over MCP Streamable HTTP.
+
+```bash
+pnpm start:http        # from TypeScript, reading .env
+pnpm build && pnpm serve:http   # from the compiled build
+```
+
+The endpoint is `http://127.0.0.1:3000/mcp` by default, with an unauthenticated `GET /healthz` for health checks. Each MCP session gets its own server instance, so write scopes enabled with `set_write_scopes` are never shared between sessions, and every session starts read-only.
+
+| Variable                   | Default     | Description                                                                                                  |
+| -------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------ |
+| `MCP_HTTP_HOST`            | `127.0.0.1` | Bind address                                                                                                 |
+| `MCP_HTTP_PORT`            | `3000`      | Port (`0` picks a free one)                                                                                  |
+| `MCP_HTTP_PATH`            | `/mcp`      | MCP endpoint path                                                                                            |
+| `MCP_AUTH_TOKEN`           | -           | Bearer token required on every MCP request                                                                   |
+| `MCP_ALLOW_UNAUTHENTICATED`| -           | Set to `true` to allow a non-loopback bind without a token (only behind an authenticating reverse proxy)      |
+| `MCP_ALLOWED_HOSTS`        | -           | Comma-separated `Host` header allowlist (DNS-rebinding protection)                                           |
+| `MCP_ALLOWED_ORIGINS`      | -           | Comma-separated `Origin` header allowlist                                                                    |
+| `MCP_SESSION_TTL_MS`       | `1800000`   | Idle session lifetime                                                                                        |
+| `MCP_MAX_BODY_BYTES`       | `16777216`  | Maximum request body size                                                                                    |
+
+Security notes:
+
+- The server holds your Qualtrics API token and can enable write scopes on request, so treat access to the endpoint as access to your Qualtrics account. It refuses to listen on a non-loopback address without `MCP_AUTH_TOKEN`.
+- Terminate TLS in a reverse proxy in front of it before exposing it to the internet. Many hosted MCP clients also expect OAuth rather than a static bearer token; if yours does, put an authenticating proxy in front and set `MCP_ALLOW_UNAUTHENTICATED=true` on the server, which should then only be reachable through that proxy.
+- Large response exports are streamed to a file in `$HOME/Downloads` on the machine running the server, not returned to the client. In a container, mount a volume there if you need them.
+- The client-side rate limiter (`RATE_LIMIT_RPM`) is per session, not global.
+
+#### Docker
+
+A `Dockerfile` and `docker-compose.example.yml` are included. The image runs `build/http.js` as a non-root user and listens on `0.0.0.0:3000` inside the container, so `MCP_AUTH_TOKEN` is required.
+
+```bash
+cp docker-compose.example.yml docker-compose.yml
+cp .env.example .env     # set QUALTRICS_API_TOKEN, QUALTRICS_DATA_CENTER and MCP_AUTH_TOKEN
+docker compose up -d --build
+```
+
+The compose example publishes the port on `127.0.0.1` only; put your reverse proxy in front of it. Then point an MCP client at the HTTPS URL with an `Authorization: Bearer <token>` header, for example in a Claude Code `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "qualtrics": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${MCP_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
 ## Qualtrics design conventions
 
 - Set an explicit, stable `DataExportTag` on every data-collecting question. The creation tools derive a readable fallback when omitted, but explicit study-specific names keep exports and pre/post measures unambiguous.
@@ -183,6 +237,7 @@ The config above fixes both: an absolute `command` path handles the first layer,
 
 ```bash
 pnpm start                 # Run from TypeScript using .env
+pnpm start:http            # Run the optional Streamable HTTP entrypoint
 pnpm dev                   # Watch mode
 pnpm typecheck             # Type-check server code
 pnpm typecheck:examples    # Type-check the MCP-only reference example

@@ -1,0 +1,12 @@
+node_modules
+build
+.git
+.env
+.env.*
+.mcp.json
+.claude
+*.log
+*.csv
+tests
+examples
+docs
