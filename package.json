@@ -6,7 +6,8 @@
   "main": "build/index.js",
   "types": "build/index.d.ts",
   "bin": {
-    "qualtrics-mcp-server": "build/index.js"
+    "qualtrics-mcp-server": "build/index.js",
+    "qualtrics-mcp-server-http": "build/http.js"
   },
   "files": [
     "build",
@@ -17,6 +18,8 @@
   "scripts": {
     "start": "tsx --env-file=.env src/index.ts",
     "dev": "tsx --watch src/index.ts",
+    "start:http": "tsx --env-file=.env src/http.ts",
+    "serve:http": "node build/http.js",
     "build": "tsgo -p tsconfig.build.json",
     "typecheck": "tsgo --noEmit",
     "typecheck:examples": "tsgo --ignoreConfig --noEmit --target es2022 --module node16 --moduleResolution node16 --strict --skipLibCheck examples/motivated-reasoning-study.ts",
