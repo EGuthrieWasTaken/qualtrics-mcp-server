@@ -73,7 +73,7 @@ pnpm example:motivated-reasoning
 - Contact identity rules vary by directory configuration; create tools accept email, first/last name, or `externalDataReference` and let Qualtrics apply the brand's exact matching requirements.
 - `bulk_import_contacts` is a bounded, sequential, non-atomic helper and reports per-input failures. It does not hide partial success.
 - `get_distribution_history` returns per-recipient delivery state (sent, opened, bounced, responded) with the `contactLookupId` that ties responses from individual-link distributions back to contacts.
-- Response downloads buffer only small results; large bodies stream to a collision-safe file in Downloads. A slow healthy transfer can exceed `REQUEST_TIMEOUT` overall because the download timeout is applied to headers and each inactive read, not total duration.
+- Response downloads buffer only small results; large bodies stream to a collision-safe file in the export directory (`~/Downloads`, or `QUALTRICS_EXPORT_DIR` when set). A slow healthy transfer can exceed `REQUEST_TIMEOUT` overall because the download timeout is applied to headers and each inactive read, not total duration.
 
 ### Advanced JSON API access
 
@@ -110,7 +110,7 @@ Use `set_write_scopes` to enable only the categories required for a task:
 
 ### Requirements
 
-- Node.js 22 or later
+- Node.js 22 or later, or just Docker (see [Docker](#docker))
 - A Qualtrics API token with the permissions required by the endpoints you use
 - Your Qualtrics data-center ID
 
@@ -132,6 +132,7 @@ pnpm start
 | `RATE_LIMITING_ENABLED` | No | `true` | Enable the client-side request limiter |
 | `RATE_LIMIT_RPM` | No | `50` | Requests per minute |
 | `REQUEST_TIMEOUT` | No | `30000` | Ordinary request timeout and response-download header/chunk inactivity timeout, in milliseconds |
+| `QUALTRICS_EXPORT_DIR` | No | `~/Downloads` | Directory where response exports are saved. The Docker image sets this to `/home/node/Downloads`. Tool arguments can only name a file inside it, never a different directory |
 
 Missing token or data-center configuration fails at startup with setup guidance. Never commit tokens; `.env` and `.mcp.json` are gitignored because they may contain secrets.
 
@@ -169,6 +170,92 @@ GUI-launched MCP clients such as Claude Desktop spawn servers with a minimal `PA
 2. Even with an absolute `npx`/`tsx` path, the script's `#!/usr/bin/env node` shebang still cannot resolve `node` (`env: node: No such file or directory`).
 
 The config above fixes both: an absolute `command` path handles the first layer, and the `PATH` entry in `env` handles shebang resolution. You can reproduce the failure outside the client by piping an `initialize` JSON-RPC request to the configured command with a stripped `PATH`.
+
+### Docker
+
+Run the server with only Docker installed; no local Node.js or pnpm is needed. The image is built from the pinned pnpm lockfile, runs as the non-root `node` user, and contains only the compiled server and its production dependencies. It speaks MCP over stdio, exactly like `node build/index.js`; it does not open a network port.
+
+```bash
+docker build -t qualtrics-mcp-server .
+```
+
+Smoke test. It prints the tool list (112 tools) and needs no real credentials, because nothing calls Qualtrics until a tool runs:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+| docker run --rm -i -e QUALTRICS_API_TOKEN=x -e QUALTRICS_DATA_CENTER=iad1 qualtrics-mcp-server
+```
+
+Then point any stdio-capable MCP client at `docker run`:
+
+```json
+{
+  "mcpServers": {
+    "qualtrics": {
+      "command": "/usr/local/bin/docker",
+      "args": [
+        "run", "--rm", "-i", "--init",
+        "-e", "QUALTRICS_API_TOKEN",
+        "-e", "QUALTRICS_DATA_CENTER",
+        "-v", "/Users/you/Downloads/qualtrics:/home/node/Downloads",
+        "qualtrics-mcp-server"
+      ],
+      "env": {
+        "QUALTRICS_API_TOKEN": "your_api_token",
+        "QUALTRICS_DATA_CENTER": "your_data_center_id"
+      }
+    }
+  }
+}
+```
+
+Things to get right:
+
+- **Use `-i`, never `-t`.** Without `-i` the server sees end-of-input on stdin and exits with status 0 and no message, which looks like success. With `-t`, the client cannot attach stdin to the TTY, and where it does attach, the TTY merges stderr into stdout and rewrites `\n` as `\r\n`, which corrupts the JSON-RPC stream.
+- **Pass secrets by name.** `-e QUALTRICS_API_TOKEN` with no `=value` makes the Docker CLI copy the value from its own environment, which the client's `env` block sets. That keeps the token out of `args`, where `ps` output and client logs would show it. It is still visible to anyone who can run `docker inspect` on the host.
+- **Use an absolute path to `docker`.** The [macOS troubleshooting](#macos-troubleshooting-server-never-appears-no-error-in-the-ui) above applies unchanged: GUI-launched clients have a minimal `PATH`. Docker Desktop installs `/usr/local/bin/docker`, and it must be running, or the server fails to start with no message in the client.
+- **Do not add `--name`.** A fixed container name makes a second concurrent client session (for example, two Claude Desktop windows) fail with a name conflict.
+- **`--init` is a cheap extra safeguard.** The server also handles `SIGTERM` and `SIGINT` itself, so `docker stop` returns promptly either way.
+
+#### Exported files
+
+Response exports over 100 KB, and any export with `saveToFile`, are written to `QUALTRICS_EXPORT_DIR`, which is `/home/node/Downloads` in the image. Without a mount, those files vanish with the container (`--rm`). Mount a host directory (the `-v` option above) and remember that **paths in tool results are container paths**:
+
+| Path in a tool result | File on the host |
+|---|---|
+| `/home/node/Downloads/survey_SV_abc_2026-01-01T00-00-00-000Z.csv` | `/Users/you/Downloads/qualtrics/survey_SV_abc_2026-01-01T00-00-00-000Z.csv` |
+
+The container runs as uid 1000. If the host directory is not writable by uid 1000 (common on Linux when your user is not uid 1000), large exports fail with `EACCES`. Fix it with `chown 1000 <dir>`, or add `--user "$(id -u):$(id -g)"` to `docker run`. On macOS with Docker Desktop, file sharing hides the uid, so this does not come up.
+
+#### Environment files
+
+`docker run --env-file` is not dotenv. Docker does not strip quotes or inline comments: `QUALTRICS_API_TOKEN="abc"` arrives as `"abc"` with the quote characters included, and `QUALTRICS_DATA_CENTER=iad1 # comment` arrives as `iad1 # comment`. `pnpm start` uses Node's `--env-file`, which strips both, so a `.env` that works with `pnpm start` can still produce 401 errors or a bad hostname in Docker. Use unquoted values with no inline comments, as `.env.example` does.
+
+#### Hardening
+
+The container works with a read-only root filesystem, all capabilities dropped, and privilege escalation blocked. The export directory still needs to be writable, so keep the volume or use a tmpfs:
+
+```bash
+docker run --rm -i --init \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /home/node/Downloads:uid=1000,gid=1000 \
+  -e QUALTRICS_API_TOKEN -e QUALTRICS_DATA_CENTER \
+  qualtrics-mcp-server
+```
+
+#### Building behind a TLS-intercepting proxy
+
+If `corepack` or `pnpm install` fails with `SELF_SIGNED_CERT_IN_CHAIN`, pass your proxy's CA as a build secret instead of baking it into the image. Change the install line in the `build` stage to:
+
+```dockerfile
+RUN --mount=type=secret,id=ca,target=/ca.crt \
+    NODE_EXTRA_CA_CERTS=/ca.crt npm_config_cafile=/ca.crt pnpm install --frozen-lockfile
+```
+
+and build with `docker build --secret id=ca,src=corp-ca.pem -t qualtrics-mcp-server .`. A proxy listening on `127.0.0.1` also needs `--network=host` at build time.
 
 ## Qualtrics design conventions
 
