@@ -173,7 +173,7 @@ The config above fixes both: an absolute `command` path handles the first layer,
 
 ### Docker
 
-Run the server with only Docker installed; no local Node.js or pnpm is needed. The image is built from the pinned pnpm lockfile, runs as the non-root `node` user, and contains only the compiled server and its production dependencies. It speaks MCP over stdio, exactly like `node build/index.js`; it does not open a network port.
+Run the server with only Docker installed; no local Node.js or pnpm is needed. The image is built from the pinned pnpm lockfile, runs as the non-root `node` user, and contains only the compiled server and its production dependencies. By default it speaks MCP over stdio, exactly like `node build/index.js`, and opens no network port. The same image also contains the optional HTTP server; see [HTTP server in Docker](#http-server-in-docker).
 
 ```bash
 docker build -t qualtrics-mcp-server .
@@ -232,7 +232,7 @@ The container runs as uid 1000. If the host directory is not writable by uid 100
 
 #### Environment files
 
-`docker run --env-file` is not dotenv. Docker does not strip quotes or inline comments: `QUALTRICS_API_TOKEN="abc"` arrives as `"abc"` with the quote characters included, and `QUALTRICS_DATA_CENTER=iad1 # comment` arrives as `iad1 # comment`. `pnpm start` uses Node's `--env-file`, which strips both, so a `.env` that works with `pnpm start` can still produce 401 errors or a bad hostname in Docker. Use unquoted values with no inline comments, as `.env.example` does.
+`docker run --env-file` is not dotenv. Docker does not strip quotes or inline comments: `QUALTRICS_API_TOKEN="abc"` arrives as `"abc"` with the quote characters included, and `QUALTRICS_DATA_CENTER=iad1 # comment` arrives as `iad1 # comment`. `pnpm start` uses Node's `--env-file`, which strips both, so a `.env` that works with `pnpm start` can still produce 401 errors or a bad hostname in Docker. Use unquoted values with no inline comments, as `.env.example` does. (Docker Compose's `env_file`, used by the HTTP example below, does its own dotenv-style parsing.)
 
 #### Hardening
 
@@ -257,6 +257,70 @@ RUN --mount=type=secret,id=ca,target=/ca.crt \
 
 and build with `docker build --secret id=ca,src=corp-ca.pem -t qualtrics-mcp-server .`. A proxy listening on `127.0.0.1` also needs `--network=host` at build time.
 
+### Remote use over Streamable HTTP (optional)
+
+The stdio entrypoint above is the default and is unchanged. If you would rather run the server once, on a server or in a container, and connect to it from several machines or from a remote-connector client, use the HTTP entrypoint. It serves the same 112 tools over MCP Streamable HTTP.
+
+```bash
+pnpm start:http        # from TypeScript, reading .env
+pnpm build && pnpm serve:http   # from the compiled build
+```
+
+The endpoint is `http://127.0.0.1:3000/mcp` by default, with an unauthenticated `GET /healthz` for health checks. Each MCP session gets its own server instance, so write scopes enabled with `set_write_scopes` are never shared between sessions, and every session starts read-only unless `QUALTRICS_READ_ONLY=false`. Like the stdio server, it exits at startup with setup guidance if the Qualtrics token or data center is missing.
+
+| Variable                   | Default     | Description                                                                                                  |
+| -------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------ |
+| `MCP_HTTP_HOST`            | `127.0.0.1` | Bind address                                                                                                 |
+| `MCP_HTTP_PORT`            | `3000`      | Port (`0` picks a free one)                                                                                  |
+| `MCP_HTTP_PATH`            | `/mcp`      | MCP endpoint path                                                                                            |
+| `MCP_AUTH_TOKEN`           | -           | Shared secret required on every MCP request, sent as `X-API-Key: <token>` or `Authorization: Bearer <token>` |
+| `MCP_ALLOW_UNAUTHENTICATED`| -           | Set to `true` to allow a non-loopback bind without a token (only behind an authenticating reverse proxy)      |
+| `MCP_ALLOWED_HOSTS`        | -           | Comma-separated `Host` header allowlist (DNS-rebinding protection)                                           |
+| `MCP_ALLOWED_ORIGINS`      | -           | Comma-separated `Origin` header allowlist                                                                    |
+| `MCP_SESSION_TTL_MS`       | `1800000`   | Idle session lifetime                                                                                        |
+| `MCP_MAX_BODY_BYTES`       | `16777216`  | Maximum request body size                                                                                    |
+
+Security notes:
+
+- The server holds your Qualtrics API token and can enable write scopes on request, so treat access to the endpoint as access to your Qualtrics account. It refuses to listen on a non-loopback address without `MCP_AUTH_TOKEN`.
+- Terminate TLS in a reverse proxy in front of it before exposing it to the internet. If your MCP client cannot send a custom header and requires OAuth instead, put an authenticating proxy in front and set `MCP_ALLOW_UNAUTHENTICATED=true` on the server, which should then only be reachable through that proxy.
+- Large response exports are streamed to a file in the export directory (`QUALTRICS_EXPORT_DIR`, default `$HOME/Downloads`) on the machine running the server, not returned to the client, and all sessions share that directory. In a container, mount a volume there if you need them.
+- The client-side rate limiter (`RATE_LIMIT_RPM`) is per session, not global.
+
+#### HTTP server in Docker
+
+The image built in [Docker](#docker) contains `build/http.js` as well. It starts the stdio server unless you ask for HTTP, which you do by passing `build/http.js` as the command. Inside the container the server listens on `0.0.0.0:3000`, so `MCP_AUTH_TOKEN` is required; it refuses to start without one. `docker-compose.example.yml` does this for you and adds a `/healthz` health check, a loopback-only published port, a volume for exports, a read-only root filesystem, and dropped capabilities:
+
+```bash
+cp docker-compose.example.yml docker-compose.yml
+cp .env.example .env     # set QUALTRICS_API_TOKEN, QUALTRICS_DATA_CENTER and MCP_AUTH_TOKEN
+docker compose up -d --build
+```
+
+Without Compose, the equivalent is:
+
+```bash
+docker run -d --init --restart unless-stopped \
+  -p 127.0.0.1:3000:3000 \
+  -e QUALTRICS_API_TOKEN -e QUALTRICS_DATA_CENTER -e MCP_AUTH_TOKEN \
+  -v qualtrics-exports:/home/node/Downloads \
+  qualtrics-mcp-server build/http.js
+```
+
+The port is published on `127.0.0.1` only; put your reverse proxy in front of it. Then point an MCP client at the HTTPS URL and send the token in an `X-API-Key` (or `Authorization: Bearer`) header. For a connector UI that supports custom headers, use the URL `https://mcp.example.com/mcp` with the header `x-api-key: <your MCP_AUTH_TOKEN>`. In a Claude Code `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "qualtrics": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "X-API-Key": "${MCP_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
 ## Qualtrics design conventions
 
 - Set an explicit, stable `DataExportTag` on every data-collecting question. The creation tools derive a readable fallback when omitted, but explicit study-specific names keep exports and pre/post measures unambiguous.
@@ -270,6 +334,7 @@ and build with `docker build --secret id=ca,src=corp-ca.pem -t qualtrics-mcp-ser
 
 ```bash
 pnpm start                 # Run from TypeScript using .env
+pnpm start:http            # Run the optional Streamable HTTP entrypoint
 pnpm dev                   # Watch mode
 pnpm typecheck             # Type-check server code
 pnpm typecheck:examples    # Type-check the MCP-only reference example

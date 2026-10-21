@@ -14,9 +14,9 @@ and then point any stdio-capable MCP client at `docker run --rm -i ... qualtrics
 
 ### Non-goals (this PR)
 
-- **HTTP/SSE transport.** The server only speaks stdio (`src/index.ts` uses `StdioServerTransport`). A network transport would add a listening port, authentication, and multi-tenant token handling. That is a separate design and should not ride along with packaging.
+- **HTTP as the default transport.** Stdio stays the default, and it is the only mode the image runs unless asked. The optional Streamable HTTP entrypoint from `feat/streamable-http-transport` is folded in as an opt-in (§11); the stdio packaging contract in §3–§8 does not depend on it.
 - **Publishing an image to a registry.** The namespace, tags, and signing for GHCR or Docker Hub are the upstream maintainer's decision. The PR ships a buildable `Dockerfile`; publishing is listed under open questions.
-- **docker-compose.** A stdio MCP server is started by the client, once per session, with stdin attached. A compose service with no stdin and no port gives users nothing useful.
+- **docker-compose for the stdio server.** A stdio MCP server is started by the client, once per session, with stdin attached. A compose service with no stdin and no port gives users nothing useful. Compose is provided only for the HTTP mode (§11), which has a port.
 
 ## 2. Deliverables
 
@@ -30,6 +30,8 @@ and then point any stdio-capable MCP client at `docker run --rm -i ... qualtrics
 | `tests/file-save.test.ts` | Test the `QUALTRICS_EXPORT_DIR` override. |
 | `README.md` | New "Docker" section with build, run, and MCP client configuration; add `QUALTRICS_EXPORT_DIR` to the configuration table (§6). |
 | `.env.example` | Add a commented `QUALTRICS_EXPORT_DIR`, and a note that `docker --env-file` does not strip quotes. |
+| `src/http.ts`, `tests/http-transport.test.ts`, `package.json` | Merged from `feat/streamable-http-transport` (§11), plus a startup check of the Qualtrics config in `src/http.ts` and two entrypoint tests. |
+| `docker-compose.example.yml` | Merged from the same branch and adapted to the shared image (§11). |
 | `.github/workflows/docker.yml` | Optional: a build-and-smoke-test check (§8). The repo has no CI today, so ask the maintainer before adding it. |
 
 `CLAUDE.md`/`AGENTS.md` need no changes: the tool count and behaviour are unchanged.
@@ -44,11 +46,11 @@ A draft of the Dockerfile below was built and run in a test environment; the res
 4. **Copy the build context explicitly, never with `COPY . .`.** Copy only the lockfile, manifests, and tsconfig files first, so the dependency layer stays cached; then copy `src/`. This, together with `.dockerignore`, keeps `.env` and `.mcp.json` out of every layer.
 5. **Run as non-root.** Use the image's built-in `node` user (uid 1000) with `HOME=/home/node`.
 6. **Create the export directory, owned by `node`, in the image.** Response exports over 100 KB are written to a directory. Without this step, a mounted named volume is created root-owned and the first large export fails with `EACCES`.
-7. **Use exec-form `ENTRYPOINT ["node", "build/index.js"]`** with no shell wrapper, so signals reach Node and nothing but the MCP stream is written to stdout.
-8. **No `EXPOSE` and no `HEALTHCHECK`.** The server has no port, and a health check cannot talk to a stdio process without consuming its protocol stream.
+7. **Use exec-form `ENTRYPOINT ["node"]` with `CMD ["build/index.js"]`** and no shell wrapper, so signals reach Node and nothing but the MCP stream is written to stdout. The default command is the stdio server; the HTTP entrypoint is selected by passing `build/http.js` as the command (§11).
+8. **No `EXPOSE` and no `HEALTHCHECK` in the image.** The default mode has no port, and a health check cannot talk to a stdio process without consuming its protocol stream. The compose example adds a `/healthz` check for HTTP mode.
 9. **Add OCI labels** (`org.opencontainers.image.source`, `.description`, `.licenses=MIT`) so registries and `docker inspect` show where the image came from.
 
-Reference implementation (verified apart from the labels and the `QUALTRICS_EXPORT_DIR` line, which depend on §5.1):
+Reference implementation, as built and verified (§8). The comments in the committed `Dockerfile` are omitted here:
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -65,11 +67,13 @@ RUN pnpm build && pnpm prune --prod
 
 FROM node:22-bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/yrvelez/qualtrics-mcp-server" \
-      org.opencontainers.image.description="MCP server for Qualtrics survey programming (stdio)" \
+      org.opencontainers.image.description="MCP server for Qualtrics survey programming (stdio by default, optional Streamable HTTP)" \
       org.opencontainers.image.licenses="MIT"
 ENV NODE_ENV=production \
     HOME=/home/node \
-    QUALTRICS_EXPORT_DIR=/home/node/Downloads
+    QUALTRICS_EXPORT_DIR=/home/node/Downloads \
+    MCP_HTTP_HOST=0.0.0.0 \
+    MCP_HTTP_PORT=3000
 WORKDIR /app
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
@@ -77,7 +81,8 @@ COPY --from=build /app/build ./build
 RUN mkdir -p /home/node/Downloads && chown node:node /home/node/Downloads
 USER node
 VOLUME ["/home/node/Downloads"]
-ENTRYPOINT ["node", "build/index.js"]
+ENTRYPOINT ["node"]
+CMD ["build/index.js"]
 ```
 
 Notes:
@@ -241,6 +246,9 @@ The PR is ready when:
 7. `pnpm typecheck` and `pnpm test` still pass, including the new export-dir test.
 8. The container runs with `--read-only --cap-drop ALL --security-opt no-new-privileges` plus a Downloads volume or tmpfs.
 9. An MCP client (Claude Desktop or Claude Code) configured as in §6 lists the tools, and a read-only call such as `list_surveys` works with real credentials.
+10. HTTP mode: `docker run -p 127.0.0.1:3000:3000 -e QUALTRICS_API_TOKEN -e QUALTRICS_DATA_CENTER -e MCP_AUTH_TOKEN qualtrics-mcp-server build/http.js` answers `GET /healthz` with 200, rejects a missing or wrong key with 401, and lists **112** tools for a valid `X-API-Key` or `Authorization: Bearer` token.
+11. HTTP mode exits **1** at startup, with the reason on stderr, when `MCP_AUTH_TOKEN` is unset (the image binds `0.0.0.0`) and when the Qualtrics token or data center is missing. `docker stop` returns in under 1 s without `--init`.
+12. `docker compose -f docker-compose.example.yml up -d` reports the service `healthy`.
 
 **Optional CI** (`.github/workflows/docker.yml`): on PRs touching `Dockerfile`, `.dockerignore`, `package.json`, the lockfile, or `src/**`, run `docker/build-push-action` with `push: false` and then the smoke test in criterion 2. Use the GitHub Actions cache (`cache-from/to: type=gha`) to keep it fast. The repo has no CI today, so offer this as a separable commit.
 
@@ -250,6 +258,7 @@ The PR is ready when:
 2. **Distroless or slim runtime?** Distroless is smaller and has no shell, which makes debugging harder. The proposed default is slim.
 3. **Host-path reporting for exports.** Should the server accept something like `QUALTRICS_EXPORT_HOST_DIR`, so that tool results report the host-side path instead of `/home/node/Downloads/...`? It is small to build but adds a configuration knob. The proposal is to document the mapping in this PR and revisit if users find it confusing.
 4. **Lockfile cleanup** (pitfall 9): fine to handle in a follow-up PR?
+5. **One image or two?** §11 uses a single image whose command selects the mode. A separate HTTP image could carry `EXPOSE` and `HEALTHCHECK` itself, at the cost of a second build target and a second tag to publish.
 
 ## 10. Implementation plan
 
@@ -259,3 +268,22 @@ The PR is ready when:
 4. Run `pnpm typecheck`, `pnpm test`, and acceptance checks 1–8.
 5. Optionally add the CI workflow (§8).
 6. Open the PR against `yrvelez/qualtrics-mcp-server:main` from this fork, linking to this spec's decisions. Before opening, decide whether this spec file goes in the upstream PR or stays in the fork; the README section may be enough on its own.
+
+## 11. Streamable HTTP mode (folded in from `feat/streamable-http-transport`)
+
+That branch has no spec document. Its design is in three commits (`14b0da0`, `c732dbf`, `ba52506`) and the README section they add, and those were treated as its spec. `src/http.ts`, its tests, the `start:http`/`serve:http` scripts, the `qualtrics-mcp-server-http` bin, and the compose example's hardening (loopback-only port, read-only root, `tmpfs` for `/tmp`, `no-new-privileges`, all capabilities dropped, an exports volume) are kept as written. Where the two designs disagreed, §3–§8 won for the image and the branch won for HTTP behaviour:
+
+| Topic | Branch | This spec | Result |
+|---|---|---|---|
+| Base image | `node:${NODE_VERSION}-slim` | `node:22-bookworm-slim` | This spec's. |
+| Build stages | `build` + `prod-deps` | `build` + `pnpm prune --prod` | This spec's. |
+| Export directory | `$HOME/Downloads` | `QUALTRICS_EXPORT_DIR` | This spec's. The HTTP README text now names it and notes that all sessions share the directory. |
+| Command | `CMD ["node", "build/http.js"]` | `ENTRYPOINT ["node", "build/index.js"]` | `ENTRYPOINT ["node"]` + `CMD ["build/index.js"]`. Stdio clients are unchanged; HTTP is `docker run … qualtrics-mcp-server build/http.js`. |
+| `EXPOSE`, `HEALTHCHECK` | In the image | Forbidden (§3.8) | Moved to the compose file, which is HTTP-only. A check in the image would fail forever, and spawn a process every 30 s, for stdio users. |
+| `MCP_HTTP_HOST=0.0.0.0`, `MCP_HTTP_PORT=3000` | Image `ENV` | n/a | Kept in the image. Only `build/http.js` reads them, and it refuses `0.0.0.0` without `MCP_AUTH_TOKEN`, so a forgotten token fails closed. |
+| `.dockerignore` | 12 entries | §4 | §4, which is a superset. |
+| Missing Qualtrics config | Not checked at startup | Exit 1 (§8.3) | `src/http.ts` now calls `loadConfig()` before listening. Before this, the process stayed up, `/healthz` returned 200, and every `initialize` returned a bare 500, so a compose health check would report a server that could serve nothing as healthy. |
+| `SIGTERM`/`SIGINT` | Handled in `http.ts` | §5.2 handles `index.ts` | Both entrypoints now handle both signals. No change to `http.ts`. |
+| README | "Docker" under the HTTP section | "Docker" under Setup | Stdio "Docker" first; the HTTP one is "HTTP server in Docker" and builds on the same image. |
+
+Verified in a real container (Docker 29.9, linux/amd64): criteria 10–12 in §8, plus the stdio criteria 2, 3, 4 and 6 re-run against the merged image. Compose's `env_file` strips quotes and inline comments, unlike `docker run --env-file` (checked on one file with both). Not verified: arm64, real Qualtrics credentials, a TLS-terminating reverse proxy in front, and `MCP_ALLOWED_HOSTS`/`MCP_ALLOWED_ORIGINS` inside a container.
