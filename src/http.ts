@@ -14,11 +14,16 @@
  *   MCP_HTTP_HOST            Bind address (default 127.0.0.1)
  *   MCP_HTTP_PORT            Port (default 3000; 0 picks a free port)
  *   MCP_HTTP_PATH            MCP endpoint path (default /mcp)
- *   MCP_AUTH_TOKEN           Shared secret required on every MCP request, sent as
+ *   MCP_AUTH_TOKEN           API key. Accepted on every MCP request as
  *                            `X-API-Key: <token>` or `Authorization: Bearer <token>`
+ *   CF_ACCESS_TEAM_DOMAIN    Cloudflare Access team (`myteam.cloudflareaccess.com`).
+ *   CF_ACCESS_AUD            Cloudflare Access application Audience (AUD) tag. Together
+ *                            these accept a valid `Cf-Access-Jwt-Assertion` token, which
+ *                            is verified here rather than trusted because of the proxy.
+ *                            With both an API key and Access configured, either is enough.
  *   MCP_ALLOW_UNAUTHENTICATED=true
- *                            Permit a non-loopback bind without MCP_AUTH_TOKEN
- *                            (only for use behind an authenticating proxy)
+ *                            Permit a non-loopback bind with no credentials configured
+ *                            (only for use behind a proxy you trust completely)
  *   MCP_ALLOWED_HOSTS        Comma-separated Host header allowlist (DNS rebinding protection)
  *   MCP_ALLOWED_ORIGINS      Comma-separated Origin header allowlist
  *   MCP_SESSION_TTL_MS       Idle session lifetime (default 1800000)
@@ -37,6 +42,7 @@ import type { AddressInfo } from "node:net";
 import { pathToFileURL } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { createCloudflareAccessVerifier, type CloudflareAccessVerifier } from "./cloudflare-access.js";
 import { loadConfig } from "./config/settings.js";
 import { createQualtricsServer } from "./server.js";
 
@@ -45,6 +51,8 @@ export interface HttpServerOptions {
   port: number;
   path: string;
   authToken?: string;
+  /** When set, a valid Cloudflare Access JWT is accepted as an alternative to authToken. */
+  cloudflareAccess?: CloudflareAccessVerifier;
   allowedHosts?: string[];
   allowedOrigins?: string[];
   sessionTtlMs: number;
@@ -90,12 +98,26 @@ export function loadHttpOptions(env: NodeJS.ProcessEnv = process.env): HttpServe
     throw new Error('MCP_HTTP_PATH must start with "/" and must not be "/healthz"');
   }
 
-  if (!authToken && !LOOPBACK_HOSTS.has(host) && env.MCP_ALLOW_UNAUTHENTICATED !== "true") {
+  const teamDomain = env.CF_ACCESS_TEAM_DOMAIN || undefined;
+  const audience = env.CF_ACCESS_AUD || undefined;
+  if (Boolean(teamDomain) !== Boolean(audience)) {
+    throw new Error("CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set together");
+  }
+  const cloudflareAccess =
+    teamDomain && audience ? createCloudflareAccessVerifier({ teamDomain, audience }) : undefined;
+
+  if (
+    !authToken &&
+    !cloudflareAccess &&
+    !LOOPBACK_HOSTS.has(host) &&
+    env.MCP_ALLOW_UNAUTHENTICATED !== "true"
+  ) {
     throw new Error(
       [
         `Refusing to listen on ${host} without authentication.`,
-        "Set MCP_AUTH_TOKEN to require a bearer token, bind to 127.0.0.1,",
-        "or set MCP_ALLOW_UNAUTHENTICATED=true if an authenticating reverse proxy sits in front.",
+        "Set MCP_AUTH_TOKEN to require an API key, set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD",
+        "to require Cloudflare Access, bind to 127.0.0.1, or set MCP_ALLOW_UNAUTHENTICATED=true",
+        "if a proxy you trust completely sits in front.",
       ].join("\n")
     );
   }
@@ -105,6 +127,7 @@ export function loadHttpOptions(env: NodeJS.ProcessEnv = process.env): HttpServe
     port: positiveInt(env.MCP_HTTP_PORT, 3000, "MCP_HTTP_PORT"),
     path,
     authToken,
+    cloudflareAccess,
     allowedHosts: splitList(env.MCP_ALLOWED_HOSTS),
     allowedOrigins: splitList(env.MCP_ALLOWED_ORIGINS),
     sessionTtlMs: positiveInt(env.MCP_SESSION_TTL_MS, 30 * 60 * 1000, "MCP_SESSION_TTL_MS"),
@@ -121,18 +144,30 @@ function tokensMatch(candidate: string, token: string): boolean {
   return timingSafeEqual(digest(candidate), digest(token));
 }
 
-/**
- * Accepts the shared secret either as `X-API-Key: <token>` (convenient for MCP
- * connector UIs that let you set a custom header) or `Authorization: Bearer <token>`.
- */
-function isAuthorized(req: IncomingMessage, token: string | undefined): boolean {
-  if (!token) return true;
-
+function matchesApiKey(req: IncomingMessage, token: string): boolean {
   const apiKey = headerValue(req, "x-api-key");
   if (apiKey !== undefined && tokensMatch(apiKey.trim(), token)) return true;
 
   const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "");
   return match !== null && tokensMatch(match[1].trim(), token);
+}
+
+/**
+ * A request is authorized by any one configured credential:
+ *  - the API key, as `X-API-Key: <token>` (convenient for MCP connector UIs that
+ *    let you set a custom header) or `Authorization: Bearer <token>`, or
+ *  - a Cloudflare Access JWT in `Cf-Access-Jwt-Assertion`, verified against the
+ *    team's signing keys. This also covers Access service tokens.
+ * With neither configured, every request is allowed (loopback or trusted proxy only).
+ */
+async function isAuthorized(req: IncomingMessage, options: HttpServerOptions): Promise<boolean> {
+  const { authToken, cloudflareAccess } = options;
+  if (!authToken && !cloudflareAccess) return true;
+
+  if (authToken && matchesApiKey(req, authToken)) return true;
+
+  const jwt = headerValue(req, "cf-access-jwt-assertion");
+  return Boolean(cloudflareAccess && jwt && (await cloudflareAccess(jwt.trim())));
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
@@ -244,14 +279,15 @@ export async function startHttpServer(options: HttpServerOptions): Promise<Runni
     if (pathname !== options.path) {
       return sendJson(res, 404, { error: "Not found" });
     }
-    if (!isAuthorized(req, options.authToken)) {
-      return sendJson(res, 401, { error: "Unauthorized" }, { "WWW-Authenticate": 'Bearer realm="qualtrics-mcp-server"' });
-    }
-
-    handleMcp(req, res).catch((error) => {
-      console.error(`Request failed: ${error instanceof Error ? error.message : String(error)}`);
-      jsonRpcError(res, 500, "Internal server error.");
-    });
+    isAuthorized(req, options)
+      .then((authorized) => {
+        if (authorized) return handleMcp(req, res);
+        sendJson(res, 401, { error: "Unauthorized" }, { "WWW-Authenticate": 'Bearer realm="qualtrics-mcp-server"' });
+      })
+      .catch((error) => {
+        console.error(`Request failed: ${error instanceof Error ? error.message : String(error)}`);
+        jsonRpcError(res, 500, "Internal server error.");
+      });
   });
 
   const sweepIntervalMs = Math.max(1000, Math.min(options.sessionTtlMs, 60_000));
@@ -299,8 +335,14 @@ async function main() {
     await loadConfig();
     const running = await startHttpServer(options);
     console.error(`Qualtrics MCP Server (Streamable HTTP) listening on ${running.url}`);
-    if (!options.authToken) {
-      console.error("Warning: MCP_AUTH_TOKEN is not set; requests are not authenticated.");
+    const methods = [
+      options.authToken && "API key",
+      options.cloudflareAccess && "Cloudflare Access",
+    ].filter(Boolean);
+    if (methods.length > 0) {
+      console.error(`Authentication: ${methods.join(" or ")}`);
+    } else {
+      console.error("Warning: no authentication configured; requests are not authenticated.");
     }
 
     const shutdown = () => {

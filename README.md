@@ -273,8 +273,10 @@ The endpoint is `http://127.0.0.1:3000/mcp` by default, with an unauthenticated 
 | `MCP_HTTP_HOST`            | `127.0.0.1` | Bind address                                                                                                 |
 | `MCP_HTTP_PORT`            | `3000`      | Port (`0` picks a free one)                                                                                  |
 | `MCP_HTTP_PATH`            | `/mcp`      | MCP endpoint path                                                                                            |
-| `MCP_AUTH_TOKEN`           | -           | Shared secret required on every MCP request, sent as `X-API-Key: <token>` or `Authorization: Bearer <token>` |
-| `MCP_ALLOW_UNAUTHENTICATED`| -           | Set to `true` to allow a non-loopback bind without a token (only behind an authenticating reverse proxy)      |
+| `MCP_AUTH_TOKEN`           | -           | API key, accepted as `X-API-Key: <key>` or `Authorization: Bearer <key>` (see [Authentication](#authentication)) |
+| `CF_ACCESS_TEAM_DOMAIN`    | -           | Cloudflare Access team, e.g. `myteam.cloudflareaccess.com`. Set together with `CF_ACCESS_AUD`                  |
+| `CF_ACCESS_AUD`            | -           | Audience (AUD) tag of your Cloudflare Access application                                                       |
+| `MCP_ALLOW_UNAUTHENTICATED`| -           | Set to `true` to allow a non-loopback bind with no credential configured (only behind a proxy you trust completely) |
 | `MCP_ALLOWED_HOSTS`        | -           | Comma-separated `Host` header allowlist (DNS-rebinding protection)                                           |
 | `MCP_ALLOWED_ORIGINS`      | -           | Comma-separated `Origin` header allowlist                                                                    |
 | `MCP_SESSION_TTL_MS`       | `1800000`   | Idle session lifetime                                                                                        |
@@ -282,18 +284,56 @@ The endpoint is `http://127.0.0.1:3000/mcp` by default, with an unauthenticated 
 
 Security notes:
 
-- The server holds your Qualtrics API token and can enable write scopes on request, so treat access to the endpoint as access to your Qualtrics account. It refuses to listen on a non-loopback address without `MCP_AUTH_TOKEN`.
-- Terminate TLS in a reverse proxy in front of it before exposing it to the internet. If your MCP client cannot send a custom header and requires OAuth instead, put an authenticating proxy in front and set `MCP_ALLOW_UNAUTHENTICATED=true` on the server, which should then only be reachable through that proxy.
+- The server holds your Qualtrics API token and can enable write scopes on request, so treat access to the endpoint as access to your Qualtrics account. It refuses to listen on a non-loopback address unless `MCP_AUTH_TOKEN` or Cloudflare Access is configured.
+- Terminate TLS in a reverse proxy in front of it before exposing it to the internet. If your MCP client cannot send a custom header and requires OAuth instead, put an authenticating proxy in front and set `MCP_ALLOW_UNAUTHENTICATED=true` on the server, which should then only be reachable through that proxy. Prefer Cloudflare Access validation (below) to that setting where you can: the server then checks a signed token instead of trusting the network path.
 - Large response exports are streamed to a file in the export directory (`QUALTRICS_EXPORT_DIR`, default `$HOME/Downloads`) on the machine running the server, not returned to the client, and all sessions share that directory. In a container, mount a volume there if you need them.
 - The client-side rate limiter (`RATE_LIMIT_RPM`) is per session, not global.
 
+#### Authentication
+
+A request to the MCP endpoint is accepted if it carries **any one** of these credentials. They are checked on every request, not only `initialize`, so a leaked session ID alone gets nobody in.
+
+| Credential | How it is sent | Enabled by |
+|---|---|---|
+| API key | `X-API-Key: <key>` or `Authorization: Bearer <key>` | `MCP_AUTH_TOKEN` |
+| Cloudflare Access token | `Cf-Access-Jwt-Assertion: <jwt>`, which Cloudflare adds itself | `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` |
+
+Either can be used alone, or both together, in which case either is enough. With neither, the server only starts on a loopback address.
+
+- **API key.** One shared secret, compared in constant time. Generate it with `openssl rand -hex 32`. Rotating it means changing the value and restarting.
+- **Cloudflare Access.** The server does not trust the header just because a proxy is in front of it. It verifies the token's RS256 signature against your team's published keys (`https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`, cached and refreshed when Cloudflare rotates them, at most one download every 30 seconds) and checks the issuer, your application's audience tag, and the expiry. A request that goes around Cloudflare, or carries a forged or other-application token, is refused. If the keys cannot be downloaded and none are cached, Access tokens are refused while API keys keep working. The team domain is `<team>.cloudflareaccess.com`, and the audience tag is shown on your application's overview page in Zero Trust.
+- **No per-user identity.** Neither credential says who is calling. Every authenticated caller uses the server's Qualtrics token and can enable write scopes for their own session.
+
+How this fits with Cloudflare:
+
+- If the hostname is an Access application, Cloudflare authenticates every request at its edge before it reaches the server, including requests that carry an API key. People pass through SSO. Scripts and MCP clients can pass with an Access service token (a Service Auth policy; the client sends `CF-Access-Client-Id` and `CF-Access-Client-Secret`), and Cloudflare then forwards a signed token for the server to validate. A request carrying only an `X-API-Key` is stopped at the edge in this setup.
+- To use the API key through Cloudflare, serve it on a hostname or path that the Access policy does not cover (or give it a Bypass policy), so that the key check is the gate. You can also reach the server directly over a LAN or VPN, where only the key applies.
+- `GET /healthz` is unauthenticated. If Access covers the hostname, point probes at the container directly.
+
+A Claude Code `.mcp.json` entry for a client that passes Access with a service token:
+
+```json
+{
+  "mcpServers": {
+    "qualtrics": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "CF-Access-Client-Id": "${CF_ACCESS_CLIENT_ID}",
+        "CF-Access-Client-Secret": "${CF_ACCESS_CLIENT_SECRET}"
+      }
+    }
+  }
+}
+```
+
 #### HTTP server in Docker
 
-The image built in [Docker](#docker) contains `build/http.js` as well. It starts the stdio server unless you ask for HTTP, which you do by passing `build/http.js` as the command. Inside the container the server listens on `0.0.0.0:3000`, so `MCP_AUTH_TOKEN` is required; it refuses to start without one. `docker-compose.example.yml` does this for you and adds a `/healthz` health check, a loopback-only published port, a volume for exports, a read-only root filesystem, and dropped capabilities:
+The image built in [Docker](#docker) contains `build/http.js` as well. It starts the stdio server unless you ask for HTTP, which you do by passing `build/http.js` as the command. Inside the container the server listens on `0.0.0.0:3000`, so it needs `MCP_AUTH_TOKEN` or the `CF_ACCESS_*` pair; it refuses to start with neither. `docker-compose.example.yml` does this for you and adds a `/healthz` health check, a loopback-only published port, a volume for exports, a read-only root filesystem, and dropped capabilities:
 
 ```bash
 cp docker-compose.example.yml docker-compose.yml
-cp .env.example .env     # set QUALTRICS_API_TOKEN, QUALTRICS_DATA_CENTER and MCP_AUTH_TOKEN
+cp .env.example .env     # set QUALTRICS_API_TOKEN, QUALTRICS_DATA_CENTER and MCP_AUTH_TOKEN and/or CF_ACCESS_*
 docker compose up -d --build
 ```
 
@@ -303,6 +343,7 @@ Without Compose, the equivalent is:
 docker run -d --init --restart unless-stopped \
   -p 127.0.0.1:3000:3000 \
   -e QUALTRICS_API_TOKEN -e QUALTRICS_DATA_CENTER -e MCP_AUTH_TOKEN \
+  -e CF_ACCESS_TEAM_DOMAIN -e CF_ACCESS_AUD \
   -v qualtrics-exports:/home/node/Downloads \
   qualtrics-mcp-server build/http.js
 ```

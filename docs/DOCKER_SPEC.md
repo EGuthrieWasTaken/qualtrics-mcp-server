@@ -247,7 +247,7 @@ The PR is ready when:
 8. The container runs with `--read-only --cap-drop ALL --security-opt no-new-privileges` plus a Downloads volume or tmpfs.
 9. An MCP client (Claude Desktop or Claude Code) configured as in §6 lists the tools, and a read-only call such as `list_surveys` works with real credentials.
 10. HTTP mode: `docker run -p 127.0.0.1:3000:3000 -e QUALTRICS_API_TOKEN -e QUALTRICS_DATA_CENTER -e MCP_AUTH_TOKEN qualtrics-mcp-server build/http.js` answers `GET /healthz` with 200, rejects a missing or wrong key with 401, and lists **112** tools for a valid `X-API-Key` or `Authorization: Bearer` token.
-11. HTTP mode exits **1** at startup, with the reason on stderr, when `MCP_AUTH_TOKEN` is unset (the image binds `0.0.0.0`) and when the Qualtrics token or data center is missing. `docker stop` returns in under 1 s without `--init`.
+11. HTTP mode exits **1** at startup, with the reason on stderr, when neither `MCP_AUTH_TOKEN` nor the `CF_ACCESS_*` pair is set (the image binds `0.0.0.0`) and when the Qualtrics token or data center is missing. `docker stop` returns in under 1 s without `--init`.
 12. `docker compose -f docker-compose.example.yml up -d` reports the service `healthy`.
 
 **Optional CI** (`.github/workflows/docker.yml`): on PRs touching `Dockerfile`, `.dockerignore`, `package.json`, the lockfile, or `src/**`, run `docker/build-push-action` with `push: false` and then the smoke test in criterion 2. Use the GitHub Actions cache (`cache-from/to: type=gha`) to keep it fast. The repo has no CI today, so offer this as a separable commit.
@@ -284,6 +284,7 @@ That branch has no spec document. Its design is in three commits (`14b0da0`, `c7
 | `.dockerignore` | 12 entries | §4 | §4, which is a superset. |
 | Missing Qualtrics config | Not checked at startup | Exit 1 (§8.3) | `src/http.ts` now calls `loadConfig()` before listening. Before this, the process stayed up, `/healthz` returned 200, and every `initialize` returned a bare 500, so a compose health check would report a server that could serve nothing as healthy. |
 | `SIGTERM`/`SIGINT` | Handled in `http.ts` | §5.2 handles `index.ts` | Both entrypoints now handle both signals. No change to `http.ts`. |
+| Authentication | One shared secret (`MCP_AUTH_TOKEN`) | n/a | Adds Cloudflare Access as an alternative (`CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD`, `src/cloudflare-access.ts`). Either credential is accepted. The signed token is verified at the origin instead of trusting the proxy, and either one satisfies the non-loopback bind guard. |
 | README | "Docker" under the HTTP section | "Docker" under Setup | Stdio "Docker" first; the HTTP one is "HTTP server in Docker" and builds on the same image. |
 
 Verified in a real container (Docker 29.9, linux/amd64): criteria 10–12 in §8, plus the stdio criteria 2, 3, 4 and 6 re-run against the merged image. Compose's `env_file` strips quotes and inline comments, unlike `docker run --env-file` (checked on one file with both). Not verified: arm64, real Qualtrics credentials, a TLS-terminating reverse proxy in front, and `MCP_ALLOWED_HOSTS`/`MCP_ALLOWED_ORIGINS` inside a container.

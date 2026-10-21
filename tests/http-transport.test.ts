@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadHttpOptions, startHttpServer, type HttpServerOptions } from "../src/http.js";
+import { createCloudflareAccessVerifier } from "../src/cloudflare-access.js";
+import { AUD, TEAM, makeKey, mintJwt, stubJwks } from "./helpers/cloudflare-access.js";
 
 const TOKEN = "test-bearer-token";
 
@@ -211,6 +213,144 @@ test("a full MCP session works with the X-API-Key header alone", async () => {
       assert.equal(tools.length, 112);
     } finally {
       await client.close();
+      await running.close();
+    }
+  });
+});
+
+const ACCESS_JWT_HEADER = "Cf-Access-Jwt-Assertion";
+
+const INITIALIZE = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  method: "initialize",
+  params: {
+    protocolVersion: "2025-03-26",
+    capabilities: {},
+    clientInfo: { name: "raw", version: "1.0.0" },
+  },
+});
+
+/** POST an initialize request with the given credential headers and return the status. */
+async function initializeStatus(url: string, headers: Record<string, string>): Promise<number> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      ...headers,
+    },
+    body: INITIALIZE,
+  });
+  await response.arrayBuffer();
+  return response.status;
+}
+
+function accessSetup() {
+  const key = makeKey("kid-1");
+  const jwks = stubJwks([key]);
+  const cloudflareAccess = createCloudflareAccessVerifier({
+    teamDomain: TEAM,
+    audience: AUD,
+    fetchJwks: jwks.fetchJwks,
+  });
+  return { key, jwks, cloudflareAccess };
+}
+
+test("loadHttpOptions validates Cloudflare Access settings and counts them as authentication", () => {
+  const complete = { CF_ACCESS_TEAM_DOMAIN: TEAM, CF_ACCESS_AUD: AUD };
+
+  assert.equal(loadHttpOptions({}).cloudflareAccess, undefined);
+  assert.equal(typeof loadHttpOptions(complete).cloudflareAccess, "function");
+
+  assert.throws(() => loadHttpOptions({ CF_ACCESS_TEAM_DOMAIN: TEAM }), /must be set together/);
+  assert.throws(() => loadHttpOptions({ CF_ACCESS_AUD: AUD }), /must be set together/);
+  assert.throws(
+    () => loadHttpOptions({ CF_ACCESS_TEAM_DOMAIN: "evil.example.com", CF_ACCESS_AUD: AUD }),
+    /CF_ACCESS_TEAM_DOMAIN/
+  );
+
+  // Access alone is enough to bind publicly; nothing configured still is not.
+  assert.doesNotThrow(() => loadHttpOptions({ MCP_HTTP_HOST: "0.0.0.0", ...complete }));
+  assert.throws(() => loadHttpOptions({ MCP_HTTP_HOST: "0.0.0.0" }), /without authentication/);
+});
+
+test("with only Cloudflare Access configured, a valid token is required and API keys do not work", async () => {
+  await withQualtricsEnv(async () => {
+    const { key, cloudflareAccess } = accessSetup();
+    const running = await startHttpServer(baseOptions({ authToken: undefined, cloudflareAccess }));
+    const origin = new URL(running.url).origin;
+    try {
+      assert.equal(await initializeStatus(running.url, {}), 401, "no credential");
+      assert.equal(await initializeStatus(running.url, { "X-API-Key": TOKEN }), 401, "no API key is configured");
+      assert.equal(await initializeStatus(running.url, { "X-API-Key": "" }), 401, "an empty key is not a match for no key");
+      assert.equal(await initializeStatus(running.url, { Authorization: "Bearer " }), 401);
+      assert.equal(await initializeStatus(running.url, { [ACCESS_JWT_HEADER]: "garbage" }), 401);
+      assert.equal(
+        await initializeStatus(running.url, { [ACCESS_JWT_HEADER]: mintJwt(key, { aud: ["other-app"] }) }),
+        401,
+        "token for a different Access application"
+      );
+      assert.equal(
+        await initializeStatus(running.url, { [ACCESS_JWT_HEADER]: mintJwt(makeKey("kid-1")) }),
+        401,
+        "token signed by a key Cloudflare never published"
+      );
+      assert.equal(await initializeStatus(running.url, { [ACCESS_JWT_HEADER]: mintJwt(key) }), 200);
+
+      const rejected = await fetch(running.url, { method: "POST", body: INITIALIZE });
+      assert.match(rejected.headers.get("www-authenticate") ?? "", /Bearer/);
+
+      assert.equal((await fetch(`${origin}/healthz`)).status, 200, "health stays open for probes");
+    } finally {
+      await running.close();
+    }
+  });
+});
+
+test("a full MCP session works with only a Cloudflare Access token", async () => {
+  await withQualtricsEnv(async () => {
+    const { key, cloudflareAccess } = accessSetup();
+    const running = await startHttpServer(baseOptions({ authToken: undefined, cloudflareAccess }));
+    // Every request in the session carries the header, as Access forwards it on each one.
+    const client = await connectClient(running.url, { [ACCESS_JWT_HEADER]: mintJwt(key) });
+    try {
+      const { tools } = await client.listTools();
+      assert.equal(tools.length, 112);
+    } finally {
+      await client.close();
+      await running.close();
+    }
+  });
+});
+
+test("an API key and Cloudflare Access are alternatives: either one is enough", async () => {
+  await withQualtricsEnv(async () => {
+    const { key, cloudflareAccess } = accessSetup();
+    const running = await startHttpServer(baseOptions({ cloudflareAccess }));
+    try {
+      const jwt = mintJwt(key);
+      assert.equal(await initializeStatus(running.url, { "X-API-Key": TOKEN }), 200, "API key alone");
+      assert.equal(await initializeStatus(running.url, { Authorization: `Bearer ${TOKEN}` }), 200);
+      assert.equal(await initializeStatus(running.url, { [ACCESS_JWT_HEADER]: jwt }), 200, "Access token alone");
+
+      assert.equal(await initializeStatus(running.url, {}), 401, "neither");
+      assert.equal(
+        await initializeStatus(running.url, { "X-API-Key": "wrong", [ACCESS_JWT_HEADER]: "garbage" }),
+        401,
+        "both invalid"
+      );
+      assert.equal(
+        await initializeStatus(running.url, { "X-API-Key": "wrong", [ACCESS_JWT_HEADER]: jwt }),
+        200,
+        "a valid Access token is enough despite a bad key"
+      );
+      assert.equal(
+        await initializeStatus(running.url, { "X-API-Key": TOKEN, [ACCESS_JWT_HEADER]: "garbage" }),
+        200,
+        "a valid key is enough despite a bad token"
+      );
+    } finally {
       await running.close();
     }
   });

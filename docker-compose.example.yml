@@ -7,6 +7,8 @@
 # Required in .env:
 #   QUALTRICS_API_TOKEN, QUALTRICS_DATA_CENTER
 #   MCP_AUTH_TOKEN          e.g. `openssl rand -hex 32`
+#   and/or CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD for Cloudflare Access
+#   (the server refuses to start without at least one of the two)
 #
 # The MCP endpoint is http://127.0.0.1:3000/mcp. Put a TLS-terminating reverse
 # proxy in front of it before exposing it to the internet.
