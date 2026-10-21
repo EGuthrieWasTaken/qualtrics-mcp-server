@@ -179,6 +179,8 @@ Run the server with only Docker installed; no local Node.js or pnpm is needed. T
 docker build -t qualtrics-mcp-server .
 ```
 
+Or skip the build: each merge to `main` that changes the image publishes `ghcr.io/eguthriewastaken/qualtrics-mcp-server` (tags `latest` and the short commit SHA, plus the version on `v*` tags), and `docker pull ghcr.io/eguthriewastaken/qualtrics-mcp-server:latest` fetches it. Use that name in place of `qualtrics-mcp-server` below.
+
 Smoke test. It prints the tool list (112 tools) and needs no real credentials, because nothing calls Qualtrics until a tool runs:
 
 ```bash
@@ -188,6 +190,8 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
 | docker run --rm -i -e QUALTRICS_API_TOKEN=x -e QUALTRICS_DATA_CENTER=iad1 qualtrics-mcp-server
 ```
+
+`scripts/docker-smoke-test.sh [image]` runs this check plus the HTTP mode and image-contents checks against any image; CI runs it before publishing anything.
 
 Then point any stdio-capable MCP client at `docker run`:
 
@@ -373,7 +377,7 @@ curl -o /boot/config/plugins/dockerMan/templates-user/my-qualtrics-mcp-server.xm
 
 Then open Docker, Add Container, pick `qualtrics-mcp-server` under User templates, fill in the Qualtrics token and data center plus your API key and/or the Cloudflare Access fields, and Apply.
 
-- **The image must be pullable.** The template names `ghcr.io/eguthriewastaken/qualtrics-mcp-server:latest`. Publish the image there (and make the package public, or log unRAID in to GHCR), or change the Repository field to wherever you publish it.
+- **The image must be pullable.** The template names `ghcr.io/eguthriewastaken/qualtrics-mcp-server:latest`, which `.github/workflows/docker.yml` publishes on merge to `main`. A newly created GHCR package may start private; if unRAID cannot pull it, set the package to public in its settings on GitHub (or log unRAID in to GHCR). To publish elsewhere, change the Repository field.
 - **Exports folder ownership.** The template runs the container as `nobody:users` (`--user 99:100`), the owner of unRAID appdata, with a read-only root filesystem and no capabilities. The Exports folder must be writable by that user. If you created it by hand as root, large exports fail with `EACCES` until you run `chown 99:100 /mnt/user/appdata/qualtrics-mcp-server/exports`.
 - **Network exposure.** Unlike the compose example, unRAID publishes the port on every interface of the server, so it is reachable on your LAN at `http://<server>:3000/mcp`. Authentication is mandatory, but put it behind a Cloudflare Tunnel or a TLS reverse proxy before exposing it beyond your network. See [Authentication](#authentication) for how Cloudflare Access and an API key combine.
 - **Read only by default.** The Read Only setting starts as `true`; clients enable write scopes per session.

@@ -33,7 +33,7 @@ and then point any stdio-capable MCP client at `docker run --rm -i ... qualtrics
 | `src/http.ts`, `tests/http-transport.test.ts`, `package.json` | Merged from `feat/streamable-http-transport` (§11), plus a startup check of the Qualtrics config in `src/http.ts` and two entrypoint tests. |
 | `docker-compose.example.yml` | Merged from the same branch and adapted to the shared image (§11). |
 | `unraid/qualtrics-mcp-server.xml`, `tests/unraid-template.test.ts` | unRAID Docker template for the HTTP mode, and a test that keeps it in step with the code (§12). |
-| `.github/workflows/docker.yml` | Optional: a build-and-smoke-test check (§8). The repo has no CI today, so ask the maintainer before adding it. |
+| `.github/workflows/docker.yml`, `scripts/docker-smoke-test.sh` | Build, smoke-test and publish the image (§8, §13). Added with the fork owner's approval; upstream maintainers should still be asked before adopting CI. |
 
 `CLAUDE.md`/`AGENTS.md` need no changes: the tool count and behaviour are unchanged.
 
@@ -251,11 +251,11 @@ The PR is ready when:
 11. HTTP mode exits **1** at startup, with the reason on stderr, when neither `MCP_AUTH_TOKEN` nor the `CF_ACCESS_*` pair is set (the image binds `0.0.0.0`) and when the Qualtrics token or data center is missing. `docker stop` returns in under 1 s without `--init`.
 12. `docker compose -f docker-compose.example.yml up -d` reports the service `healthy`.
 
-**Optional CI** (`.github/workflows/docker.yml`): on PRs touching `Dockerfile`, `.dockerignore`, `package.json`, the lockfile, or `src/**`, run `docker/build-push-action` with `push: false` and then the smoke test in criterion 2. Use the GitHub Actions cache (`cache-from/to: type=gha`) to keep it fast. The repo has no CI today, so offer this as a separable commit.
+**CI** (`.github/workflows/docker.yml`): on PRs touching `Dockerfile`, `.dockerignore`, `package.json`, the lockfile, or `src/**`, build the image and run `scripts/docker-smoke-test.sh` without publishing. Pushes to `main` and `v*` tags run the same checks and then publish (§13). The Actions cache (`cache-from/to: type=gha`) keeps it fast.
 
 ## 9. Open questions for the upstream maintainer
 
-1. **Publish an image?** If yes: GHCR under `ghcr.io/yrvelez/qualtrics-mcp-server`, multi-arch, tagged on release. Users could then skip the build step, and the README could use the published image name.
+1. **Publish an image?** Done for the fork (§13): GHCR under `ghcr.io/eguthriewastaken/qualtrics-mcp-server`, `linux/amd64` by default, with `linux/arm64` as an opt-in. For upstream the question stands: `ghcr.io/yrvelez/qualtrics-mcp-server`, multi-arch, tagged on release.
 2. **Distroless or slim runtime?** Distroless is smaller and has no shell, which makes debugging harder. The proposed default is slim.
 3. **Host-path reporting for exports.** Should the server accept something like `QUALTRICS_EXPORT_HOST_DIR`, so that tool results report the host-side path instead of `/home/node/Downloads/...`? It is small to build but adds a configuration knob. The proposal is to document the mapping in this PR and revisit if users find it confusing.
 4. **Lockfile cleanup** (pitfall 9): fine to handle in a follow-up PR?
@@ -296,7 +296,7 @@ Verified in a real container (Docker 29.9, linux/amd64): criteria 10–12 in §8
 
 | Template field | Value | Why |
 |---|---|---|
-| `Repository` | `ghcr.io/eguthriewastaken/qualtrics-mcp-server:latest` | unRAID pulls from a registry and cannot build, so an image must be published. This is open question 1 in §9, and it is the one thing the template cannot work without. |
+| `Repository` | `ghcr.io/eguthriewastaken/qualtrics-mcp-server:latest` | unRAID pulls from a registry and cannot build, so an image must be published. `.github/workflows/docker.yml` publishes it on merge to `main` (§13). |
 | `PostArgs` | `build/http.js` | Selects the HTTP entrypoint (§11), since the image defaults to stdio. |
 | `ExtraParams` | `--init --user 99:100 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp` | The hardening from §6, plus `--user 99:100` (`nobody:users`, the owner of unRAID appdata) so exports land with the ownership unRAID expects. This is the `--user` remedy for pitfall 4. |
 | Required fields | `QUALTRICS_API_TOKEN`, `QUALTRICS_DATA_CENTER`, the port, the export path | `MCP_AUTH_TOKEN` and the `CF_ACCESS_*` pair are optional individually, because either authenticates; the server refuses to start with neither. |
@@ -305,4 +305,21 @@ Verified in a real container (Docker 29.9, linux/amd64): criteria 10–12 in §8
 
 `tests/unraid-template.test.ts` fails if a template variable is not read by `src/`, if the port or export path drifts from the Dockerfile, if `PostArgs` stops naming the HTTP entrypoint, or if an authentication variable becomes mandatory.
 
-Verified by turning the template into the `docker run` unRAID would build (options, extra parameters, image, then post arguments; every variable passed, empty or not) and running it: healthy with an API key; Cloudflare-only; refuses to start with neither credential or without the Qualtrics token; runs as 99:100 with a read-only root and no capabilities; a large export lands on the host owned by 99:100; a root-owned export folder fails with `EACCES` and works after `chown 99:100`; `docker stop` takes 0.19 s. Not verified: installing through the unRAID web UI itself, Community Applications submission, and a published image. `Icon` is empty.
+Verified by turning the template into the `docker run` unRAID would build (options, extra parameters, image, then post arguments; every variable passed, empty or not) and running it: healthy with an API key; Cloudflare-only; refuses to start with neither credential or without the Qualtrics token; runs as 99:100 with a read-only root and no capabilities; a large export lands on the host owned by 99:100; a root-owned export folder fails with `EACCES` and works after `chown 99:100`; `docker stop` takes 0.19 s. Not verified: installing through the unRAID web UI itself and Community Applications submission. `Icon` is empty.
+
+## 13. Publishing the image
+
+`.github/workflows/docker.yml` builds the image, smoke-tests it, and publishes it to GitHub Container Registry. It uses only the `GITHUB_TOKEN` GitHub provides to each run, so no secret is stored in the repository or the workflow.
+
+| Event | Build and smoke test | Publish |
+|---|---|---|
+| Pull request touching the image's inputs | Yes | No |
+| Push to `main` (not docs, tests, unRAID, compose, or `.env.example` only) | Yes | `latest` and `sha-<short>` |
+| Push of a `v*` tag | Yes | `<version>`, `<major>.<minor>` and `sha-<short>` |
+| `workflow_dispatch` | Yes | Only when run on `main` or a `v*` tag |
+
+- **The smoke test is a script, not workflow YAML**, so it can be run and tested anywhere: `scripts/docker-smoke-test.sh [image]` checks image contents and user, stdio (tool count, only JSON-RPC on stdout, exit 1 on missing config, clean stop), and HTTP (refuses to start without a credential or Qualtrics config, rejects a missing or wrong key, accepts `X-API-Key` and Bearer, lists the tools, clean stop). Each check was shown to fail on an image with the matching defect: running as root, a banner on stdout, no `SIGTERM` handler, an unauthenticated HTTP server, a source tree left in the image, and a wrong tool count.
+- **Platforms:** `linux/amd64` by default, which covers unRAID and is exactly what was built and tested. Add `linux/arm64` to `PLATFORMS` for an arm64 image; it builds under QEMU, which has not been verified here (pitfall 11).
+- **Names and labels:** the image name is lowercased from the repository, because registry paths must be lowercase and the owner is not. `org.opencontainers.image.source` and `.revision` come from the run (so GHCR links the package to the repository); description and license come from the `Dockerfile`.
+- **Provenance attestations are off**, because they add an `unknown/unknown` entry to the image index that some pull tools handle poorly.
+- **Not verified:** the workflow itself, which cannot run outside GitHub. It passes `actionlint`, and every command it runs is the tested script or a standard action. A newly created GHCR package may start private; it must be public for an unauthenticated pull (for example by unRAID).
