@@ -32,6 +32,7 @@ and then point any stdio-capable MCP client at `docker run --rm -i ... qualtrics
 | `.env.example` | Add a commented `QUALTRICS_EXPORT_DIR`, and a note that `docker --env-file` does not strip quotes. |
 | `src/http.ts`, `tests/http-transport.test.ts`, `package.json` | Merged from `feat/streamable-http-transport` (§11), plus a startup check of the Qualtrics config in `src/http.ts` and two entrypoint tests. |
 | `docker-compose.example.yml` | Merged from the same branch and adapted to the shared image (§11). |
+| `unraid/qualtrics-mcp-server.xml`, `tests/unraid-template.test.ts` | unRAID Docker template for the HTTP mode, and a test that keeps it in step with the code (§12). |
 | `.github/workflows/docker.yml` | Optional: a build-and-smoke-test check (§8). The repo has no CI today, so ask the maintainer before adding it. |
 
 `CLAUDE.md`/`AGENTS.md` need no changes: the tool count and behaviour are unchanged.
@@ -288,3 +289,20 @@ That branch has no spec document. Its design is in three commits (`14b0da0`, `c7
 | README | "Docker" under the HTTP section | "Docker" under Setup | Stdio "Docker" first; the HTTP one is "HTTP server in Docker" and builds on the same image. |
 
 Verified in a real container (Docker 29.9, linux/amd64): criteria 10–12 in §8, plus the stdio criteria 2, 3, 4 and 6 re-run against the merged image. Compose's `env_file` strips quotes and inline comments, unlike `docker run --env-file` (checked on one file with both). Not verified: arm64, real Qualtrics credentials, a TLS-terminating reverse proxy in front, and `MCP_ALLOWED_HOSTS`/`MCP_ALLOWED_ORIGINS` inside a container.
+
+## 12. unRAID template
+
+`unraid/qualtrics-mcp-server.xml` is a Community Applications template (`Container version="2"`) for the HTTP mode. It translates the image's configuration into unRAID's form:
+
+| Template field | Value | Why |
+|---|---|---|
+| `Repository` | `ghcr.io/eguthriewastaken/qualtrics-mcp-server:latest` | unRAID pulls from a registry and cannot build, so an image must be published. This is open question 1 in §9, and it is the one thing the template cannot work without. |
+| `PostArgs` | `build/http.js` | Selects the HTTP entrypoint (§11), since the image defaults to stdio. |
+| `ExtraParams` | `--init --user 99:100 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp` | The hardening from §6, plus `--user 99:100` (`nobody:users`, the owner of unRAID appdata) so exports land with the ownership unRAID expects. This is the `--user` remedy for pitfall 4. |
+| Required fields | `QUALTRICS_API_TOKEN`, `QUALTRICS_DATA_CENTER`, the port, the export path | `MCP_AUTH_TOKEN` and the `CF_ACCESS_*` pair are optional individually, because either authenticates; the server refuses to start with neither. |
+| Optional fields | Passed as empty strings, as unRAID does | Every one is read with `\|\|` or a default, so an empty value behaves as unset. |
+| Network | `bridge`, host port published on all interfaces | Unlike the compose example (loopback only). Authentication is mandatory, which makes this safe on a LAN. |
+
+`tests/unraid-template.test.ts` fails if a template variable is not read by `src/`, if the port or export path drifts from the Dockerfile, if `PostArgs` stops naming the HTTP entrypoint, or if an authentication variable becomes mandatory.
+
+Verified by turning the template into the `docker run` unRAID would build (options, extra parameters, image, then post arguments; every variable passed, empty or not) and running it: healthy with an API key; Cloudflare-only; refuses to start with neither credential or without the Qualtrics token; runs as 99:100 with a read-only root and no capabilities; a large export lands on the host owned by 99:100; a root-owned export folder fails with `EACCES` and works after `chown 99:100`; `docker stop` takes 0.19 s. Not verified: installing through the unRAID web UI itself, Community Applications submission, and a published image. `Icon` is empty.

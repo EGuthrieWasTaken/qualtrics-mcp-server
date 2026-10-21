@@ -362,6 +362,22 @@ The port is published on `127.0.0.1` only; put your reverse proxy in front of it
 }
 ```
 
+#### unRAID
+
+`unraid/qualtrics-mcp-server.xml` is a Docker template for unRAID. It runs the HTTP server, so it needs an API key, Cloudflare Access, or both; the container refuses to start with neither. Install it by saving the template where unRAID looks for user templates, then adding the container from it:
+
+```bash
+curl -o /boot/config/plugins/dockerMan/templates-user/my-qualtrics-mcp-server.xml \
+  https://raw.githubusercontent.com/EGuthrieWasTaken/qualtrics-mcp-server/main/unraid/qualtrics-mcp-server.xml
+```
+
+Then open Docker, Add Container, pick `qualtrics-mcp-server` under User templates, fill in the Qualtrics token and data center plus your API key and/or the Cloudflare Access fields, and Apply.
+
+- **The image must be pullable.** The template names `ghcr.io/eguthriewastaken/qualtrics-mcp-server:latest`. Publish the image there (and make the package public, or log unRAID in to GHCR), or change the Repository field to wherever you publish it.
+- **Exports folder ownership.** The template runs the container as `nobody:users` (`--user 99:100`), the owner of unRAID appdata, with a read-only root filesystem and no capabilities. The Exports folder must be writable by that user. If you created it by hand as root, large exports fail with `EACCES` until you run `chown 99:100 /mnt/user/appdata/qualtrics-mcp-server/exports`.
+- **Network exposure.** Unlike the compose example, unRAID publishes the port on every interface of the server, so it is reachable on your LAN at `http://<server>:3000/mcp`. Authentication is mandatory, but put it behind a Cloudflare Tunnel or a TLS reverse proxy before exposing it beyond your network. See [Authentication](#authentication) for how Cloudflare Access and an API key combine.
+- **Read only by default.** The Read Only setting starts as `true`; clients enable write scopes per session.
+
 ## Qualtrics design conventions
 
 - Set an explicit, stable `DataExportTag` on every data-collecting question. The creation tools derive a readable fallback when omitted, but explicit study-specific names keep exports and pre/post measures unambiguous.
