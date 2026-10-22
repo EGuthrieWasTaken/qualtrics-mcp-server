@@ -33,7 +33,10 @@ function exportFilePath(
   saveToFile?: string,
   suffix?: string
 ): string {
-  const downloadsDirectory = path.join(os.homedir(), "Downloads");
+  // Resolved per call so the environment can change between exports. The env
+  // var moves the base directory only; tool arguments still never choose it.
+  const downloadsDirectory =
+    process.env.QUALTRICS_EXPORT_DIR || path.join(os.homedir(), "Downloads");
   if (saveToFile) {
     if (
       saveToFile === "." ||

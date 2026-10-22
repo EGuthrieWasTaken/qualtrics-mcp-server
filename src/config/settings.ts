@@ -74,6 +74,8 @@ export async function loadConfig(): Promise<QualtricsConfig> {
     "  2. Fill in your values         →  open .env",
     "  3. Run again                   →  pnpm start",
     "",
+    "Docker: pass -e QUALTRICS_API_TOKEN -e QUALTRICS_DATA_CENTER to docker run",
+    "",
   ].join("\n");
 
   throw new Error(message);
