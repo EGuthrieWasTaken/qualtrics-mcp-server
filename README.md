@@ -179,7 +179,7 @@ Run the server with only Docker installed; no local Node.js or pnpm is needed. T
 docker build -t qualtrics-mcp-server .
 ```
 
-Or skip the build: each merge to `main` that changes the image publishes `ghcr.io/eguthriewastaken/qualtrics-mcp-server` (tags `latest` and the short commit SHA, plus the version on `v*` tags), and `docker pull ghcr.io/eguthriewastaken/qualtrics-mcp-server:latest` fetches it. Use that name in place of `qualtrics-mcp-server` below.
+Or skip the build: each merge to `main` that changes the image publishes `ghcr.io/eguthriewastaken/qualtrics-mcp-server` for `linux/amd64` and `linux/arm64` (tags `latest` and the short commit SHA, plus the version on `v*` tags), and `docker pull ghcr.io/eguthriewastaken/qualtrics-mcp-server:latest` fetches it. Use that name in place of `qualtrics-mcp-server` below.
 
 Smoke test. It prints the tool list (112 tools) and needs no real credentials, because nothing calls Qualtrics until a tool runs:
 

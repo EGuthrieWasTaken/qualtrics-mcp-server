@@ -5,11 +5,15 @@
 #
 # Uses dummy credentials; nothing here calls Qualtrics. Needs docker, curl and node.
 # EXPECTED_TOOLS (default 112) and SMOKE_PORT (default 3999) can be overridden.
+# SMOKE_STARTUP_TIMEOUT (seconds, default 60) bounds every wait for a server to
+# start, which is slow for an image running under emulation (for example arm64
+# on an amd64 host).
 set -euo pipefail
 
 IMAGE="${1:-qualtrics-mcp-server}"
 EXPECTED_TOOLS="${EXPECTED_TOOLS:-112}"
 PORT="${SMOKE_PORT:-3999}"
+STARTUP_TIMEOUT="${SMOKE_STARTUP_TIMEOUT:-60}"
 NAME="qualtrics-mcp-smoke-$$"
 WORK="$(mktemp -d)"
 CREDS=(-e QUALTRICS_API_TOKEN=x -e QUALTRICS_DATA_CENTER=iad1)
@@ -58,10 +62,21 @@ expect_exit() {
 expect_refusal() {
   local got
   docker run -d --name "$NAME" "$@" >/dev/null
-  got=$(timeout 30 docker wait "$NAME") || fail "the container kept running; expected it to refuse to start: $*"
+  got=$(timeout "$STARTUP_TIMEOUT" docker wait "$NAME") || fail "the container kept running; expected it to refuse to start: $*"
   docker logs "$NAME" >"$WORK/out" 2>"$WORK/err"
   docker rm -f "$NAME" >/dev/null
   [ "$got" -eq 1 ] || fail "expected exit 1, got $got from: $*"
+}
+
+# Wait until the named container has logged the given text. The server installs
+# its SIGTERM handler before it logs this, so a stop test is only meaningful after.
+wait_for_log() {
+  local deadline=$((SECONDS + STARTUP_TIMEOUT))
+  until docker logs "$NAME" 2>&1 | grep -q "$1"; do
+    [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" = "true" ] || fail "the container exited before logging '$1': $(docker logs "$NAME" 2>&1 | tail -3)"
+    [ "$SECONDS" -lt "$deadline" ] || fail "the container did not log '$1' within ${STARTUP_TIMEOUT}s"
+    sleep 0.5
+  done
 }
 
 stop_seconds() {
@@ -97,7 +112,7 @@ grep -q "missing configuration" "$WORK/err" || fail "missing config gave no mess
 pass "stdio: exits 1 with a message on stderr when configuration is missing"
 
 docker run -d -i --name "$NAME" "${CREDS[@]}" "$IMAGE" >/dev/null
-sleep 2
+wait_for_log "running in READ-ONLY mode"
 elapsed=$(stop_seconds)
 [ "$elapsed" -lt 5 ] || fail "stdio: docker stop took ${elapsed}s (SIGTERM is not handled)"
 [ "$(docker inspect -f '{{.State.ExitCode}}' "$NAME")" = "0" ] || fail "stdio: did not exit 0 on SIGTERM"
@@ -114,7 +129,7 @@ grep -q "missing configuration" "$WORK/err" || fail "http: missing Qualtrics con
 pass "http: exits 1 when the Qualtrics configuration is missing"
 
 docker run -d --name "$NAME" -p "127.0.0.1:$PORT:3000" "${CREDS[@]}" -e MCP_AUTH_TOKEN=smoke-key "$IMAGE" build/http.js >/dev/null
-for _ in $(seq 1 40); do
+for _ in $(seq 1 $((STARTUP_TIMEOUT * 2))); do
   [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/healthz" || true)" = "200" ] && break
   sleep 0.5
 done

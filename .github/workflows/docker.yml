@@ -1,7 +1,8 @@
 name: Docker image
 
-# Pull requests: build the image and run the smoke test. Nothing is published.
-# Pushes to main and v* tags: the same, then publish to GitHub Container Registry.
+# Every run builds each platform, smoke-tests it, and builds the multi-platform
+# image. Only pushes to main and v* tags then publish it to GitHub Container
+# Registry; pull requests never do.
 # The only credential is the GITHUB_TOKEN GitHub provides to every run.
 on:
   pull_request:
@@ -35,14 +36,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Platforms to publish. Add linux/arm64 for an arm64 image too; it is built
-  # under QEMU, which is slower and has not been verified for this project.
-  PLATFORMS: linux/amd64
+  # Platforms to build and publish. Everything except linux/amd64 builds and
+  # runs under QEMU on the amd64 runner, which is slower.
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   image:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -58,18 +59,37 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build for the smoke test
+      - name: Build linux/amd64 for the smoke test
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64
           load: true
           tags: qualtrics-mcp-server:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
           provenance: false
 
-      - name: Smoke test
+      - name: Smoke test linux/amd64
         run: ./scripts/docker-smoke-test.sh qualtrics-mcp-server:ci
+
+      - name: Build linux/arm64 for the smoke test
+        if: contains(env.PLATFORMS, 'arm64')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: qualtrics-mcp-server:ci-arm64
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+          provenance: false
+
+      - name: Smoke test linux/arm64 (emulated)
+        if: contains(env.PLATFORMS, 'arm64')
+        env:
+          SMOKE_STARTUP_TIMEOUT: "120"
+        run: ./scripts/docker-smoke-test.sh qualtrics-mcp-server:ci-arm64
 
       - name: Set image name
         if: env.PUBLISH == 'true'
@@ -97,21 +117,24 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
 
-      - name: Build and push
-        if: env.PUBLISH == 'true'
+      # On pull requests this builds every platform without pushing, so a
+      # broken build for any of them is caught before the merge.
+      - name: Build all platforms (and push when publishing)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: ${{ env.PLATFORMS }}
-          push: true
+          push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           # Only the labels that depend on this run. The description and
           # license labels come from the Dockerfile.
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Reuse the per-platform builds above; do not overwrite their caches.
+          cache-from: |
+            type=gha,scope=amd64
+            type=gha,scope=arm64
           # Attestation manifests add an unknown/unknown entry to the image
           # index, which some pull tools handle poorly.
           provenance: false

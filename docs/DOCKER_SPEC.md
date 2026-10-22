@@ -255,7 +255,7 @@ The PR is ready when:
 
 ## 9. Open questions for the upstream maintainer
 
-1. **Publish an image?** Done for the fork (§13): GHCR under `ghcr.io/eguthriewastaken/qualtrics-mcp-server`, `linux/amd64` by default, with `linux/arm64` as an opt-in. For upstream the question stands: `ghcr.io/yrvelez/qualtrics-mcp-server`, multi-arch, tagged on release.
+1. **Publish an image?** Done for the fork (§13): GHCR under `ghcr.io/eguthriewastaken/qualtrics-mcp-server`, for `linux/amd64` and `linux/arm64`. For upstream the question stands: `ghcr.io/yrvelez/qualtrics-mcp-server`, multi-arch, tagged on release.
 2. **Distroless or slim runtime?** Distroless is smaller and has no shell, which makes debugging harder. The proposed default is slim.
 3. **Host-path reporting for exports.** Should the server accept something like `QUALTRICS_EXPORT_HOST_DIR`, so that tool results report the host-side path instead of `/home/node/Downloads/...`? It is small to build but adds a configuration knob. The proposal is to document the mapping in this PR and revisit if users find it confusing.
 4. **Lockfile cleanup** (pitfall 9): fine to handle in a follow-up PR?
@@ -313,13 +313,14 @@ Verified by turning the template into the `docker run` unRAID would build (optio
 
 | Event | Build and smoke test | Publish |
 |---|---|---|
-| Pull request touching the image's inputs | Yes | No |
+| Pull request touching the image's inputs | Yes, on every platform | No |
 | Push to `main` (not docs, tests, unRAID, compose, or `.env.example` only) | Yes | `latest` and `sha-<short>` |
 | Push of a `v*` tag | Yes | `<version>`, `<major>.<minor>` and `sha-<short>` |
 | `workflow_dispatch` | Yes | Only when run on `main` or a `v*` tag |
 
-- **The smoke test is a script, not workflow YAML**, so it can be run and tested anywhere: `scripts/docker-smoke-test.sh [image]` checks image contents and user, stdio (tool count, only JSON-RPC on stdout, exit 1 on missing config, clean stop), and HTTP (refuses to start without a credential or Qualtrics config, rejects a missing or wrong key, accepts `X-API-Key` and Bearer, lists the tools, clean stop). Each check was shown to fail on an image with the matching defect: running as root, a banner on stdout, no `SIGTERM` handler, an unauthenticated HTTP server, a source tree left in the image, and a wrong tool count.
-- **Platforms:** `linux/amd64` by default, which covers unRAID and is exactly what was built and tested. Add `linux/arm64` to `PLATFORMS` for an arm64 image; it builds under QEMU, which has not been verified here (pitfall 11).
+- **The smoke test is a script, not workflow YAML**, so it can be run and tested anywhere (CI runs it once per platform, with the arm64 image emulated): `scripts/docker-smoke-test.sh [image]` checks image contents and user, stdio (tool count, only JSON-RPC on stdout, exit 1 on missing config, clean stop), and HTTP (refuses to start without a credential or Qualtrics config, rejects a missing or wrong key, accepts `X-API-Key` and Bearer, lists the tools, clean stop). Each check was shown to fail on an image with the matching defect: running as root, a banner on stdout, no `SIGTERM` handler, an unauthenticated HTTP server, a source tree left in the image, and a wrong tool count.
+- **Platforms:** `linux/amd64` and `linux/arm64`, set in `PLATFORMS`. The arm64 image builds and runs under QEMU on the amd64 runner, so each platform is built and smoke-tested separately (separate cache scopes), and the multi-platform build that follows reuses both. Pull requests build every platform, so a broken arm64 build is caught before the merge and not on the first publish. Every wait in the smoke script is a bounded poll (`SMOKE_STARTUP_TIMEOUT`, 120 s for arm64), not a fixed sleep, because emulated startup is slow.
 - **Names and labels:** the image name is lowercased from the repository, because registry paths must be lowercase and the owner is not. `org.opencontainers.image.source` and `.revision` come from the run (so GHCR links the package to the repository); description and license come from the `Dockerfile`.
 - **Provenance attestations are off**, because they add an `unknown/unknown` entry to the image index that some pull tools handle poorly.
-- **Not verified:** the workflow itself, which cannot run outside GitHub. It passes `actionlint`, and every command it runs is the tested script or a standard action. A newly created GHCR package may start private; it must be public for an unauthenticated pull (for example by unRAID).
+- **Verified for arm64** on an amd64 host with QEMU 8.2: the image builds (the real `pnpm install` and `tsgo` build run under emulation), reports `aarch64`, and passes the whole smoke test in about 30 s. That is user-mode emulation, not an arm64 machine, so Apple Silicon and Raspberry Pi behaviour is expected but not observed.
+- **Not verified:** the workflow itself, which cannot run outside GitHub, and the final multi-platform push. It passes `actionlint`, and every command it runs is the tested script or a standard action. A newly created GHCR package may start private; it must be public for an unauthenticated pull (for example by unRAID).
