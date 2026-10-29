@@ -1,0 +1,57 @@
+# Example deployment of the Streamable HTTP server.
+#
+#   cp docker-compose.example.yml docker-compose.yml
+#   cp .env.example .env     # then fill in the values below
+#   docker compose up -d --build
+#
+# Required in .env:
+#   QUALTRICS_API_TOKEN, QUALTRICS_DATA_CENTER
+#   MCP_AUTH_TOKEN          e.g. `openssl rand -hex 32`
+#   and/or CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD for Cloudflare Access
+#   (the server refuses to start without at least one of the two)
+#
+# The MCP endpoint is http://127.0.0.1:3000/mcp. Put a TLS-terminating reverse
+# proxy in front of it before exposing it to the internet.
+
+services:
+  qualtrics-mcp:
+    build: .
+    image: qualtrics-mcp-server:local
+    # The image runs the stdio server by default; this selects Streamable HTTP.
+    command: ["build/http.js"]
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "3000"
+      # Optional Host/Origin allowlists (DNS-rebinding protection):
+      # MCP_ALLOWED_HOSTS: mcp.example.com
+      # MCP_ALLOWED_ORIGINS: https://mcp.example.com
+    ports:
+      # Published on loopback only; reach it through your reverse proxy.
+      - "127.0.0.1:3000:3000"
+    volumes:
+      # Where large response exports are written (QUALTRICS_EXPORT_DIR).
+      - qualtrics-exports:/home/node/Downloads
+    # The image has no HEALTHCHECK because its default stdio mode has no port.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:' + (process.env.MCP_HTTP_PORT || 3000) + '/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  qualtrics-exports:

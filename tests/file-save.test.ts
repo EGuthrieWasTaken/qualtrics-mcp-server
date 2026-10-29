@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   consumeExportDownload,
   saveExportToFile,
   writeBufferFully,
 } from "../src/utils/file-save.js";
+
+// The tests below assume the default ~/Downloads location, so an override
+// exported in the developer's shell must not leak in.
+delete process.env.QUALTRICS_EXPORT_DIR;
 
 test("response export filenames cannot escape the fixed Downloads directory", async () => {
   for (const filename of [
@@ -41,6 +45,56 @@ test("an existing Downloads file is never removed when exclusive creation fails"
     );
     assert.equal(await readFile(target, "utf8"), "user-owned-data");
   } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("QUALTRICS_EXPORT_DIR moves the export directory away from HOME", async () => {
+  const home = await mkdtemp(join(tmpdir(), "qualtrics-export-home-test-"));
+  const exportDir = await mkdtemp(join(tmpdir(), "qualtrics-export-dir-test-"));
+
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  process.env.QUALTRICS_EXPORT_DIR = exportDir;
+  try {
+    const generated = await saveExportToFile("generated-data", "SV_1", "csv");
+    assert.equal(dirname(generated.filePath), exportDir);
+    assert.equal(await readFile(generated.filePath, "utf8"), "generated-data");
+
+    const named = await saveExportToFile("named-data", "SV_1", "csv", "named");
+    assert.equal(named.filePath, join(exportDir, "named.csv"));
+    assert.equal(await readFile(named.filePath, "utf8"), "named-data");
+
+    // Nothing may land under the default location.
+    await assert.rejects(stat(join(home, "Downloads")), /ENOENT/);
+
+    // The override moves the base directory only; filenames stay filename-only.
+    await assert.rejects(
+      saveExportToFile("data", "SV_1", "csv", "../outside.csv"),
+      /filename only/
+    );
+  } finally {
+    delete process.env.QUALTRICS_EXPORT_DIR;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(home, { recursive: true, force: true });
+    await rm(exportDir, { recursive: true, force: true });
+  }
+});
+
+test("an empty QUALTRICS_EXPORT_DIR falls back to ~/Downloads", async () => {
+  const home = await mkdtemp(join(tmpdir(), "qualtrics-export-empty-test-"));
+
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  process.env.QUALTRICS_EXPORT_DIR = "";
+  try {
+    const saved = await saveExportToFile("data", "SV_1", "csv", "fallback");
+    assert.equal(saved.filePath, join(home, "Downloads", "fallback.csv"));
+  } finally {
+    delete process.env.QUALTRICS_EXPORT_DIR;
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
     await rm(home, { recursive: true, force: true });
